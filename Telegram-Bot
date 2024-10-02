@@ -1,0 +1,226 @@
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import ReplyKeyboardMarkup
+import asyncio, logging
+from datetime import datetime, timedelta
+
+API_TOKEN = '7519972570:AAHzOa2mk5bzG6sr-8KkB_W4o5fBZrfXSbA'  # Замените на ваш токен
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+logging.basicConfig(level=logging.INFO)
+
+class UserState(StatesGroup):
+    registration = State()
+    role_selection = State()
+    login = State()
+    password = State()
+    taxi_details = State()
+    main_menu_client = State()
+    main_menu_driver = State()
+    taxi_order_from = State()
+    taxi_order_to = State()
+    complaint = State()
+
+user_data = {}
+active_orders = {}
+order_expiry = timedelta(minutes=5)
+taxi_data = {}  # Данные таксистов
+
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    buttons = [[types.KeyboardButton(text="Регистрация")], [types.KeyboardButton(text="Авторизация")]]
+    keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    await message.reply("Выберите:\n1. Регистрация\n2. Авторизация", reply_markup=keyboard)
+
+@dp.message(lambda message: message.text == "Регистрация")
+async def register(message: types.Message, state: FSMContext):
+    await message.reply("Введите номер и ФИО (1234567890, Иванов И.И.)")
+    await state.set_state(UserState.registration)
+
+@dp.message(UserState.registration)
+async def handle_register(message: types.Message, state: FSMContext):
+    info = [x.strip() for x in message.text.split(",")]
+    if len(info) != 2 or not info[0].isdigit() or len(info[0]) != 10:
+        return await message.reply("Ошибка формата. Введите как указано.")
+
+    await state.update_data(phone=info[0], name=info[1])
+    await message.reply("Введите логин:")
+    await state.set_state(UserState.login)
+
+@dp.message(UserState.login)
+async def handle_login(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+
+    # Проверка на наличие данных
+    if 'phone' not in data:
+        return await message.reply("Сначала зарегистрируйтесь, чтобы установить номер.")
+
+    user_data[message.from_user.id] = {
+        'phone': data['phone'],
+        'name': data['name'],
+        'login': message.text.strip()
+    }
+    await message.reply("Введите пароль:")
+    await state.set_state(UserState.password)
+
+@dp.message(UserState.password)
+async def handle_password(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if user_id not in user_data:
+        return await message.reply("Ошибка: вы не зарегистрированы. Введите /start для начала.")
+
+    user_data[user_id]['password'] = message.text.strip()
+    await message.reply("Регистрация завершена! Выберите вашу роль:")
+
+    await select_role(message, state)
+
+async def select_role(message: types.Message, state: FSMContext):
+    buttons = [
+        [types.KeyboardButton(text="Клиент")],
+        [types.KeyboardButton(text="Таксист")],
+        [types.KeyboardButton(text="Администратор")],
+        [types.KeyboardButton(text="Тех. поддержка")]
+    ]
+    keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    await message.reply("Выберите вашу роль:", reply_markup=keyboard)
+    await state.set_state(UserState.role_selection)
+
+@dp.message(lambda message: message.text == "Клиент", UserState.role_selection)
+async def client_menu(message: types.Message, state: FSMContext):
+    user_data[message.from_user.id]['role'] = 'Клиент'
+    await main_menu_client(message)
+
+@dp.message(lambda message: message.text == "Таксист", UserState.role_selection)
+async def taxi_driver(message: types.Message, state: FSMContext):
+    await message.reply("Пожалуйста, отправьте фотографию вашего автомобиля и документы.")
+    await state.set_state(UserState.taxi_details)
+
+@dp.message(UserState.taxi_details)
+async def handle_taxi_details(message: types.Message, state: FSMContext):
+    if message.photo:
+        user_id = message.from_user.id
+        taxi_data[user_id] = {
+            'photo': message.photo[-1].file_id,
+            'documents': "documents_info",  # Измените на нужную логику для документов
+            'car_number': "car_number",  # Измените на нужную логику для номера авто
+            'user_id': user_id
+        }
+        user_data[user_id]['role'] = 'Таксист'
+        await message.answer("Вы успешно зарегистрированы как таксист!")
+        await main_menu_driver(message)
+    else:
+        await message.answer("Пожалуйста, отправьте фотографию вашего автомобиля.")
+
+@dp.message(lambda message: message.text == "Авторизация")
+async def authorize(message: types.Message, state: FSMContext):
+    await message.reply("Введите логин:")
+    await state.set_state(UserState.login)
+
+@dp.message(UserState.login)
+async def login_input(message: types.Message, state: FSMContext):
+    login = message.text.strip()
+    for user_id, user_info in user_data.items():
+        if user_info['login'] == login:
+            await state.update_data(user_id=user_id)  # Сохраняем ID пользователя
+            await message.reply("Введите пароль:")
+            await state.set_state(UserState.password)
+            return
+
+    await message.reply("Логин не найден. Попробуйте еще раз или зарегистрируйтесь.")
+    await start(message)
+
+@dp.message(UserState.password)
+async def password_input(message: types.Message, state: FSMContext):
+    user_data_id = (await state.get_data()).get('user_id')
+    if user_data_id is not None and user_data[user_data_id]['password'] == message.text.strip():
+        role = user_data[user_data_id]['role']
+        await message.reply(f"Авторизация успешна! Ваша роль: {role}.")
+        if role == 'Клиент':
+            await main_menu_client(message)
+        elif role == 'Таксист':
+            await main_menu_driver(message)
+        # Добавьте другие роли, если необходимо
+    else:
+        await message.reply("Пароль неверный. Попробуйте снова.")
+        await start(message)
+
+async def main_menu_client(message: types.Message):
+    buttons = [
+        [types.KeyboardButton(text="Заказать такси")],
+        [types.KeyboardButton(text="Сменить роль")],
+        [types.KeyboardButton(text="Написать жалобу")],
+        [types.KeyboardButton(text="Выйти с аккаунта")]
+    ]
+    keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    await message.reply("Главное меню клиента:", reply_markup=keyboard)
+
+@dp.message(lambda message: message.text == "Заказать такси", UserState.main_menu_client)
+async def taxi_order_start(message: types.Message, state: FSMContext):
+    if message.from_user.id in active_orders:
+        return await message.reply("У вас уже есть оставленная заявка, ожидайте.")
+
+    await message.reply("Напишите, откуда вас забрать:")
+    await state.set_state(UserState.taxi_order_from)
+
+@dp.message(UserState.taxi_order_from)
+async def taxi_order_from(message: types.Message, state: FSMContext):
+    await state.update_data(from_address=message.text.strip())
+    await message.reply("Напишите, куда вас отвезти:")
+    await state.set_state(UserState.taxi_order_to)
+
+@dp.message(UserState.taxi_order_to)
+async def taxi_order_to(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    from_address = data.get('from_address')
+    to_address = message.text.strip()
+
+    # Сохранение заказа
+    order_id = message.from_user.id
+    active_orders[order_id] = {
+        'from': from_address,
+        'to': to_address,
+        'user_id': message.from_user.id,
+        'username': message.from_user.username,
+        'expires_at': datetime.now() + order_expiry
+    }
+    await message.reply("Заявка отправлена, ожидайте в течение 5 минут.")
+    await state.set_state(UserState.main_menu_client)
+
+    # Ожидание 5 минут, проверка, принят ли заказ
+    await asyncio.sleep(order_expiry.total_seconds())
+    if order_id in active_orders:
+        del active_orders[order_id]
+        await message.reply("Заказ не был принят. Закажите такси заново, так как 5 минут уже прошли.")
+
+@dp.message(lambda message: message.text == "Написать жалобу", UserState.main_menu_client)
+async def handle_complaint(message: types.Message, state: FSMContext):
+    await message.reply("Жалоба оставлена, тех. поддержка вам ответит.")
+    await main_menu_client(message)
+
+@dp.message(lambda message: message.text == "Выйти с аккаунта", UserState.main_menu_client)
+async def logout(message: types.Message, state: FSMContext):
+    await state.clear()
+    await start(message)
+
+@dp.message(lambda message: message.text == "Посмотреть заявки", UserState.main_menu_driver)
+async def view_orders(message: types.Message):
+    await message.reply("Вы можете увидеть ваши заявки здесь.")  # Добавьте логику для отображения заявок таксиста
+
+async def main_menu_driver(message: types.Message):
+    buttons = [
+        [types.KeyboardButton(text="Посмотреть заявки")],
+        [types.KeyboardButton(text="Мои заявки")],
+        [types.KeyboardButton(text="Написать жалобу")],
+        [types.KeyboardButton(text="Выйти с аккаунта")]
+    ]
+    keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    await message.reply("Главное меню таксиста:", reply_markup=keyboard)
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
